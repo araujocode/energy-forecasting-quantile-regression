@@ -48,9 +48,11 @@ def load_artifacts():
 
     return model_median, model_peak, scaler_ar, scaler_env, full_data, features
 
+
 def get_shap_explainer(_model):
     """Creates the SHAP explainer for a given model."""
     return shap.TreeExplainer(_model)
+
 
 model_median, model_peak, scaler_ar, scaler_env, full_data, EXPECTED_COLUMNS = (
     load_artifacts()
@@ -104,7 +106,6 @@ except IndexError:
     st.error("Could not find the selected date in the dataset. Please refresh.")
     st.stop()
 
-# Use the FeatureEngineer class
 fe = FeatureEngineer(history_df.set_index("date"))
 df_featured = (
     fe.create_time_features()
@@ -154,12 +155,12 @@ col1.metric("Valor Real (Wh)", f"{actual_value:.2f}")
 col2.metric(
     "Previsão Mediana (50º %)",
     f"{pred_final_median:.2f}",
-    delta=f"{(pred_final_median - actual_value):.2f}",
+    delta=f"{round(pred_final_median - actual_value, 2)}",
 )
 col3.metric(
     "Previsão de Pico (90º %)",
     f"{pred_final_peak:.2f}",
-    delta=f"{(pred_final_peak - actual_value):.2f}",
+    delta=f"{round(pred_final_peak - actual_value, 2)}",
 )
 
 with st.expander("O que significam essas previsões?"):
@@ -213,9 +214,11 @@ st.pyplot(fig)
 
 
 # --- SHAP Plot Display ---
+# vvvvvvvvvvvvvvvv THIS IS THE FIX vvvvvvvvvvvvvvvv
 def shap_plot(explainer, shap_values, features):
-    """Helper function to create and display a SHAP force plot."""
-    p = shap.force_plot(
+    """Helper function to create and robustly display a SHAP force plot."""
+    # Let shap create the plot on the global figure context
+    shap.force_plot(
         explainer.expected_value,
         shap_values,
         features,
@@ -223,8 +226,11 @@ def shap_plot(explainer, shap_values, features):
         show=False,
         text_rotation=10,
     )
-    st.pyplot(p, bbox_inches="tight", clear_figure=True)
+    # Grab the current figure that SHAP just created and pass it to Streamlit
+    st.pyplot(plt.gcf(), bbox_inches="tight", clear_figure=True)
 
+
+# ^^^^^^^^^^^^^^^^ END OF FIX ^^^^^^^^^^^^^^^
 
 st.subheader("Por que os modelos fizeram essas previsões?")
 st.markdown(
