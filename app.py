@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -29,6 +30,9 @@ def load_artifacts():
         st.error("Model/scalers/data not found. Please run `python train.py` first.")
         return [None] * 5
 
+    if "rv1" in full_data.columns and "rv2" in full_data.columns:
+        full_data = full_data.drop(columns=["rv1", "rv2"])
+
     # Create the feature list from a sample to ensure consistency
     sample_df = full_data.head(200).copy()
     fe = FeatureEngineer(sample_df.set_index("date"))
@@ -45,11 +49,14 @@ def load_artifacts():
     return model_median, model_peak, scaler_ar, scaler_env, full_data, features
 
 
-@st.cache_resource
+# vvvvvvvvvvvvvvvv THIS IS THE FIX vvvvvvvvvvvvvvvv
+# REMOVED the @st.cache_resource decorator from this function to prevent incorrect caching.
 def get_shap_explainer(_model):
-    """Creates and caches the SHAP explainer for a given model."""
+    """Creates the SHAP explainer for a given model."""
     return shap.TreeExplainer(_model)
 
+
+# ^^^^^^^^^^^^^^^^ END OF FIX ^^^^^^^^^^^^^^^
 
 model_median, model_peak, scaler_ar, scaler_env, full_data, EXPECTED_COLUMNS = (
     load_artifacts()
@@ -76,7 +83,6 @@ Use the sidebar to select a time from the test period and see how the models per
 with st.sidebar:
     st.header("Forecasting Options")
 
-    # Define the start of the test set for the slider
     test_period_start_index = int(len(full_data) * 0.85)
     test_period_start = full_data["date"].iloc[test_period_start_index]
     test_period_end = full_data["date"].iloc[-1]
@@ -149,7 +155,6 @@ actual_value = history_df.iloc[-1]["Appliances"]
 
 # --- Display Results ---
 st.header(f"Forecast for: {selected_date.strftime('%Y-%m-%d %H:%M')}")
-
 col1, col2, col3 = st.columns(3)
 col1.metric("Actual Value (Wh)", f"{actual_value:.2f}")
 col2.metric(
@@ -212,40 +217,35 @@ ax.legend()
 plt.tight_layout()
 st.pyplot(fig)
 
+
+# --- SHAP Plot Display ---
+def shap_plot(explainer, shap_values, features):
+    """Helper function to create and display a SHAP force plot."""
+    p = shap.force_plot(
+        explainer.expected_value,
+        shap_values,
+        features,
+        matplotlib=True,
+        show=False,
+        text_rotation=10,
+    )
+    st.pyplot(p, bbox_inches="tight", clear_figure=True)
+
+
 st.subheader("Why did the models make these predictions?")
 st.markdown(
     "These **SHAP plots** show the impact of each feature on the final prediction. Features in **red** pushed the prediction higher, while features in **blue** pushed it lower. This shows how the model 'thinks'."
 )
-
 col_shap1, col_shap2 = st.columns(2)
+
 with col_shap1:
     st.markdown("##### Median Forecast Explanation")
     explainer_median = get_shap_explainer(model_median)
     shap_values_median = explainer_median.shap_values(X_pred_scaled)
-    fig_median_shap, ax_median_shap = plt.subplots()
-    shap.force_plot(
-        explainer_median.expected_value,
-        shap_values_median[0, :],
-        X_pred,
-        matplotlib=True,
-        show=False,
-        text_rotation=15,
-        ax=ax_median_shap,
-    )
-    st.pyplot(fig_median_shap, bbox_inches="tight")
+    shap_plot(explainer_median, shap_values_median[0, :], X_pred)
 
 with col_shap2:
     st.markdown("##### Peak Forecast Explanation")
     explainer_peak = get_shap_explainer(model_peak)
     shap_values_peak = explainer_peak.shap_values(X_pred_scaled)
-    fig_peak_shap, ax_peak_shap = plt.subplots()
-    shap.force_plot(
-        explainer_peak.expected_value,
-        shap_values_peak[0, :],
-        X_pred,
-        matplotlib=True,
-        show=False,
-        text_rotation=15,
-        ax=ax_peak_shap,
-    )
-    st.pyplot(fig_peak_shap, bbox_inches="tight")
+    shap_plot(explainer_peak, shap_values_peak[0, :], X_pred)
