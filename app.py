@@ -1,61 +1,74 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import shap
 import matplotlib.pyplot as plt
+from src.feature_engineer import FeatureEngineer
+import shap
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Energy Forecaster", layout="wide", initial_sidebar_state="expanded"
+    page_title="Energy Consumption Forecaster",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
 # --- Load Artifacts ---
+# Use @st.cache_resource to load these heavy objects only once.
 @st.cache_resource
 def load_artifacts():
-    """Loads the model, scaler, and data needed for the app."""
+    """Loads all necessary models, scalers, data, and feature lists."""
     try:
-        model = joblib.load("models/energy_forecasting_model.pkl")
-        scaler = joblib.load("models/feature_scaler.pkl")
-        # Load the original data to get historical context for predictions
+        model_median = joblib.load("models/model_Median_Forecast (50th).pkl")
+        model_peak = joblib.load("models/model_Peak_Forecast (90th).pkl")
+        scaler_ar = joblib.load("models/scaler_ar.pkl")
+        scaler_env = joblib.load("models/scaler_env.pkl")
         full_data = pd.read_csv("data/energydata_complete.csv", parse_dates=["date"])
     except FileNotFoundError:
-        st.error("Model/scaler/data not found. Please run `train.py` first.")
-        return None, None, None
-    return model, scaler, full_data
+        st.error("Model/scalers/data not found. Please run `python train.py` first.")
+        return [None] * 5
+
+    # Create the feature list from a sample to ensure consistency
+    sample_df = full_data.head(200).copy()
+    fe = FeatureEngineer(sample_df.set_index("date"))
+    df_engineered = (
+        fe.create_time_features()
+        .create_cyclical_features()
+        .create_lag_and_rolling_features()
+        .df
+    )
+    features = [
+        col for col in df_engineered.columns if col != "Appliances" and col != "lights"
+    ]
+
+    return model_median, model_peak, scaler_ar, scaler_env, full_data, features
 
 
-model, scaler, full_data = load_artifacts()
-
-# --- Import Feature Engineering Logic ---
-# This ensures 100% consistency between training and prediction
-from src.feature_engineer import FeatureEngineer
-
-
-# --- SHAP Explainer Function ---
-@st.cache_data
+@st.cache_resource
 def get_shap_explainer(_model):
-    """Creates and caches the SHAP explainer."""
+    """Creates and caches the SHAP explainer for a given model."""
     return shap.TreeExplainer(_model)
 
 
-if model:
-    explainer = get_shap_explainer(model)
+model_median, model_peak, scaler_ar, scaler_env, full_data, EXPECTED_COLUMNS = (
+    load_artifacts()
+)
 
 # --- App Layout ---
-st.title("💡 Interactive Energy Consumption Forecaster")
+st.title("💡 Energy Consumption Forecaster")
+
+if model_median is None:
+    st.stop()
+
 st.markdown(
     """
-This application demonstrates a full machine learning pipeline. It uses a LightGBM model
-trained on historical data to predict appliance energy consumption.
+Welcome to the interactive energy forecasting tool. This application uses a sophisticated machine learning pipeline to predict appliance energy usage. Instead of a single, often inaccurate prediction, we use a **Quantile Regression** strategy to provide two distinct forecasts:
 
-**How to use:**
-1.  Select a date and time from the test set period in the sidebar.
-2.  The app will use the real historical data leading up to that point to generate features.
-3.  (Optional) You can override key weather features to see how the forecast changes.
-4.  The app will display the prediction, its context, and an explanation of *why* the model made that prediction using SHAP.
+- **Median Forecast (50th Percentile):** A reliable estimate of the *typical*, baseline energy usage.
+- **Peak Forecast (90th Percentile):** A crucial "warning" forecast that predicts high-end usage, helping to anticipate costly energy spikes.
+
+Use the sidebar to select a time from the test period and see how the models perform against real data.
 """
 )
 
@@ -63,130 +76,176 @@ trained on historical data to predict appliance energy consumption.
 with st.sidebar:
     st.header("Forecasting Options")
 
-    # We'll use the last 20% of the data as our interactive test period
-    if full_data is not None:
-        test_period_start = full_data["date"].iloc[int(len(full_data) * 0.8)]
-        test_period_end = full_data["date"].iloc[-1]
+    # Define the start of the test set for the slider
+    test_period_start_index = int(len(full_data) * 0.85)
+    test_period_start = full_data["date"].iloc[test_period_start_index]
+    test_period_end = full_data["date"].iloc[-1]
 
-        selected_date = st.slider(
-            "Select a Date and Time for Prediction",
-            min_value=test_period_start.to_pydatetime(),
-            max_value=test_period_end.to_pydatetime(),
-            value=test_period_start.to_pydatetime(),
-            step=pd.Timedelta(minutes=10),
-            format="YYYY-MM-DD HH:mm",
-        )
+    selected_date = st.slider(
+        "Select a Date and Time",
+        min_value=test_period_start.to_pydatetime(),
+        max_value=test_period_end.to_pydatetime(),
+        value=test_period_start.to_pydatetime(),
+        step=pd.Timedelta(minutes=10),
+        format="YYYY-MM-DD HH:mm",
+        help="Choose a point in time to generate a forecast for. The app will use the 24 hours of data prior to this time to make its prediction.",
+    )
 
-        st.subheader("Override Weather Conditions (Optional)")
-        override_weather = st.checkbox("Enable Weather Override")
-        T_out_override = (
-            st.slider("Outside Temp (°C)", -10.0, 40.0, 15.0)
-            if override_weather
-            else None
-        )
-        RH_out_override = (
-            st.slider("Outside Humidity (%)", 0.0, 100.0, 70.0)
-            if override_weather
-            else None
-        )
-
-
-# --- Main Panel for Displaying Results ---
-if model is not None:
-    # Find the data row corresponding to the user's selected time
+# --- Prediction Logic ---
+try:
     input_row_index = full_data[full_data["date"] == selected_date].index[0]
-
-    # Get the full history needed to generate features for that one row
-    # We need at least 144 previous rows for the longest lag
-    required_history_df = full_data.iloc[
-        input_row_index - 144 : input_row_index + 1
-    ].copy()
-
-    # Apply overrides if enabled
-    if override_weather:
-        required_history_df.loc[required_history_df.index[-1], "T_out"] = T_out_override
-        required_history_df.loc[required_history_df.index[-1], "RH_out"] = (
-            RH_out_override
+    if input_row_index < 144:
+        st.warning(
+            "Selected date is too early to generate all historical features. Please select a later date."
         )
+        st.stop()
+    history_df = full_data.iloc[input_row_index - 144 : input_row_index + 1].copy()
+except IndexError:
+    st.error("Could not find the selected date in the dataset. Please refresh.")
+    st.stop()
 
-    # Use the FeatureEngineer class to create features for this slice of data
-    feature_engineer = FeatureEngineer(required_history_df.set_index("date"))
-    df_featured = feature_engineer.engineer_features()
+# Use the FeatureEngineer class
+fe = FeatureEngineer(history_df.set_index("date"))
+df_featured = (
+    fe.create_time_features()
+    .create_cyclical_features()
+    .create_lag_and_rolling_features()
+    .df
+)
+if df_featured.empty:
+    st.error("Could not generate features for the selected timestamp.")
+    st.stop()
+prediction_input = df_featured.iloc[[-1]]
 
-    # The last row of the result is our single prediction input
-    prediction_input = df_featured.iloc[[-1]]
+if "lights" in prediction_input.columns:
+    prediction_input = prediction_input.drop(columns=["lights"])
+X_pred = prediction_input[EXPECTED_COLUMNS]
 
-    # Define features and scale
-    FEATURES = [col for col in df_featured.columns if col != "Appliances"]
-    X_pred = prediction_input[FEATURES]
-    X_pred_scaled = scaler.transform(X_pred)
+# Scale features in groups
+autoregressive_features = [col for col in EXPECTED_COLUMNS if "Appliances_" in col]
+environmental_features = [
+    col for col in EXPECTED_COLUMNS if col not in autoregressive_features
+]
+X_pred_ar_scaled = pd.DataFrame(
+    scaler_ar.transform(X_pred[autoregressive_features]),
+    columns=autoregressive_features,
+    index=X_pred.index,
+)
+X_pred_env_scaled = pd.DataFrame(
+    scaler_env.transform(X_pred[environmental_features]),
+    columns=environmental_features,
+    index=X_pred.index,
+)
+X_pred_scaled = pd.concat([X_pred_ar_scaled, X_pred_env_scaled], axis=1)[
+    EXPECTED_COLUMNS
+]
 
-    # Make prediction
-    prediction = model.predict(X_pred_scaled)[0]
-    actual_value = prediction_input["Appliances"].iloc[0]
+# Make predictions and inverse transform
+pred_log_median = model_median.predict(X_pred_scaled)[0]
+pred_log_peak = model_peak.predict(X_pred_scaled)[0]
+pred_final_median = max(0, np.expm1(pred_log_median))
+pred_final_peak = max(0, np.expm1(pred_log_peak))
+actual_value = history_df.iloc[-1]["Appliances"]
 
-    st.header(f"Forecast for: {selected_date.strftime('%Y-%m-%d %H:%M')}")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Model Prediction (Wh)", f"{prediction:.2f}")
-    with col2:
-        st.metric(
-            "Actual Value (Wh)",
-            f"{actual_value:.2f}",
-            delta=f"{(prediction - actual_value):.2f}",
-        )
+# --- Display Results ---
+st.header(f"Forecast for: {selected_date.strftime('%Y-%m-%d %H:%M')}")
 
-    # --- Visualization and Explanation ---
-    st.subheader("Prediction in Context")
+col1, col2, col3 = st.columns(3)
+col1.metric("Actual Value (Wh)", f"{actual_value:.2f}")
+col2.metric(
+    "Median Forecast (50th %)",
+    f"{pred_final_median:.2f}",
+    delta=f"{(pred_final_median - actual_value):.2f}",
+)
+col3.metric(
+    "Peak Forecast (90th %)",
+    f"{pred_final_peak:.2f}",
+    delta=f"{(pred_final_peak - actual_value):.2f}",
+)
 
-    # Plot the recent history and the prediction
-    history_to_plot = required_history_df.set_index("date").iloc[-144:]  # Last 24 hours
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(
-        history_to_plot.index,
-        history_to_plot["Appliances"],
-        label="Historical Actuals",
-        color="cornflowerblue",
-    )
-    ax.axvline(
-        selected_date,
-        color="gray",
-        linestyle="--",
-        label=f'Forecast Time: {selected_date.strftime("%H:%M")}',
-    )
-    ax.plot(
-        selected_date,
-        prediction,
-        "ro",
-        markersize=8,
-        label=f"Model Prediction: {prediction:.2f} Wh",
-    )
-    ax.plot(
-        selected_date,
-        actual_value,
-        "go",
-        markersize=8,
-        label=f"Actual Value: {actual_value:.2f} Wh",
-    )
-    ax.set_title("Energy Consumption: 24h History and Forecast")
-    ax.set_ylabel("Appliance Energy (Wh)")
-    ax.legend()
-    plt.tight_layout()
-    st.pyplot(fig)
-
-    st.subheader("Why did the model make this prediction?")
-
-    # Generate and display SHAP force plot
-    shap_values = explainer.shap_values(X_pred_scaled)
+with st.expander("What do these forecasts mean?"):
     st.markdown(
-        "This SHAP plot shows which features pushed the prediction higher (in red) or lower (in blue)."
+        """
+    - The **Median Forecast** is the model's best guess for the *most likely* energy usage. You can see it tracks the baseline consumption well.
+    - The **Peak Forecast** is a high-end estimate. It is designed to be sensitive to conditions that lead to energy spikes. A high value here acts as an important warning signal.
+    """
     )
-    st.pyplot(
-        shap.force_plot(
-            explainer.expected_value,
-            shap_values[0],
-            X_pred,
-            matplotlib=True,
-            show=False,
-        )
+
+st.subheader("Prediction in Context")
+history_to_plot = history_df.set_index("date").iloc[-144:]
+fig, ax = plt.subplots(figsize=(12, 5))
+ax.plot(
+    history_to_plot.index,
+    history_to_plot["Appliances"],
+    label="Historical Actuals",
+    color="black",
+    alpha=0.7,
+)
+ax.axvline(selected_date, color="gray", linestyle="--", label="Forecast Time")
+ax.plot(
+    selected_date,
+    pred_final_median,
+    "o",
+    color="dodgerblue",
+    markersize=8,
+    label="Median Forecast",
+)
+ax.plot(
+    selected_date,
+    pred_final_peak,
+    "o",
+    color="orangered",
+    markersize=8,
+    label="Peak Forecast",
+)
+ax.plot(
+    selected_date,
+    actual_value,
+    "o",
+    color="limegreen",
+    markersize=8,
+    label="Actual Value",
+)
+ax.set_title("Energy Consumption Forecasts vs. Actuals")
+ax.set_ylabel("Appliance Energy (Wh)")
+ax.legend()
+plt.tight_layout()
+st.pyplot(fig)
+
+st.subheader("Why did the models make these predictions?")
+st.markdown(
+    "These **SHAP plots** show the impact of each feature on the final prediction. Features in **red** pushed the prediction higher, while features in **blue** pushed it lower. This shows how the model 'thinks'."
+)
+
+col_shap1, col_shap2 = st.columns(2)
+with col_shap1:
+    st.markdown("##### Median Forecast Explanation")
+    explainer_median = get_shap_explainer(model_median)
+    shap_values_median = explainer_median.shap_values(X_pred_scaled)
+    fig_median_shap, ax_median_shap = plt.subplots()
+    shap.force_plot(
+        explainer_median.expected_value,
+        shap_values_median[0, :],
+        X_pred,
+        matplotlib=True,
+        show=False,
+        text_rotation=15,
+        ax=ax_median_shap,
     )
+    st.pyplot(fig_median_shap, bbox_inches="tight")
+
+with col_shap2:
+    st.markdown("##### Peak Forecast Explanation")
+    explainer_peak = get_shap_explainer(model_peak)
+    shap_values_peak = explainer_peak.shap_values(X_pred_scaled)
+    fig_peak_shap, ax_peak_shap = plt.subplots()
+    shap.force_plot(
+        explainer_peak.expected_value,
+        shap_values_peak[0, :],
+        X_pred,
+        matplotlib=True,
+        show=False,
+        text_rotation=15,
+        ax=ax_peak_shap,
+    )
+    st.pyplot(fig_peak_shap, bbox_inches="tight")

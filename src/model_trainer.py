@@ -5,192 +5,226 @@ import joblib
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import TimeSeriesSplit, learning_curve
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    mean_pinball_loss,
+)  # <-- ADDED Pinball Loss
 import lightgbm as lgb
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-import optuna
-import shap  # <-- ADD THIS IMPORT
+import shap
+
 
 class ModelTrainer:
     """
-    A class to handle model training, evaluation, and visualization.
+    Final version: Implements Quantile Regression, generates correct training
+    curves, and evaluates using the correct metric (Pinball Loss).
     """
+
     def __init__(self, df: pd.DataFrame, features: list, target: str):
         self.df = df
         self.features = features
         self.target = target
+
+        # Using pre-determined robust hyperparameters for quantile regression
         self.models = {
-            "Linear Regression": LinearRegression(),
-            "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1, max_depth=10),
-            "LightGBM": lgb.LGBMRegressor(random_state=42) # Start with a basic model before optimization
+            "Median_Forecast (50th)": lgb.LGBMRegressor(
+                objective="quantile",
+                alpha=0.5,
+                n_estimators=1000,
+                learning_rate=0.05,
+                num_leaves=31,
+                random_state=42,
+                verbose=-1,
+            ),
+            "Peak_Forecast (90th)": lgb.LGBMRegressor(
+                objective="quantile",
+                alpha=0.9,
+                n_estimators=1000,
+                learning_rate=0.05,
+                num_leaves=31,
+                random_state=42,
+                verbose=-1,
+            ),
         }
+
         self.trained_models = {}
-        self.scaler = MinMaxScaler()
+        self.training_histories = {}
+        self.scaler_ar = StandardScaler()
+        self.scaler_env = StandardScaler()
 
     def prepare_data(self):
-        """Splits and scales the data for training and testing."""
+        """Splits data and scales feature groups separately."""
+        if "lights" in self.features:
+            self.features.remove("lights")
+            print("Removed 'lights' feature.")
+
+        self.autoregressive_features = [
+            col for col in self.features if "Appliances_" in col
+        ]
+        self.environmental_features = [
+            col for col in self.features if col not in self.autoregressive_features
+        ]
         X = self.df[self.features]
         y = self.df[self.target]
-        split_index = int(len(self.df) * 0.8)
-        self.X_train, self.X_test = X.iloc[:split_index], X.iloc[split_index:]
-        self.y_train, self.y_test = y.iloc[:split_index], y.iloc[split_index:]
-        
-        # We need to keep a DataFrame version of X_test for SHAP plots
-        self.X_test_df = self.X_test.copy() 
 
-        self.X_train_scaled = self.scaler.fit_transform(self.X_train)
-        self.X_test_scaled = self.scaler.transform(self.X_test)
-        print("Data split and scaled.")
-        
-    def optimize_hyperparameters(self, n_trials=50):
-        """Uses Optuna to find the best hyperparameters for LightGBM."""
-        print(f"--- Starting Hyperparameter Optimization with Optuna ({n_trials} trials) ---")
-        
-        def objective(trial):
-            params = {
-                'objective': 'regression_l1', 'metric': 'rmse',
-                'n_estimators': trial.suggest_int('n_estimators', 400, 2500),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
-                'num_leaves': trial.suggest_int('num_leaves', 20, 300),
-                'max_depth': trial.suggest_int('max_depth', 4, 15),
-                'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
-                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-                'random_state': 42, 'n_jobs': -1,
-            }
-            model = lgb.LGBMRegressor(**params)
-            model.fit(self.X_train_scaled, self.y_train, eval_set=[(self.X_test_scaled, self.y_test)], eval_metric='rmse', callbacks=[lgb.early_stopping(50, verbose=False)])
-            preds = model.predict(self.X_test_scaled)
-            rmse = np.sqrt(mean_squared_error(self.y_test, preds))
-            return rmse
+        train_end_idx = int(len(self.df) * 0.85)
+        self.X_train, self.X_test = X.iloc[:train_end_idx], X.iloc[train_end_idx:]
+        self.y_train, self.y_test = y.iloc[:train_end_idx], y.iloc[train_end_idx:]
 
-        optuna.logging.set_verbosity(optuna.logging.INFO)
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=n_trials)
+        # Create a validation set from the end of the training set
+        train_val_split_idx = int(len(self.X_train) * 0.8)
+        self.X_train_part = self.X_train.iloc[:train_val_split_idx]
+        self.y_train_part = self.y_train.iloc[:train_val_split_idx]
+        self.X_val_part = self.X_train.iloc[train_val_split_idx:]
+        self.y_val_part = self.y_train.iloc[train_val_split_idx:]
 
-        print("\nBest trial found by Optuna:")
-        print(f"  Value (RMSE): {study.best_value:.4f}")
-        print("  Best Params: ")
-        for key, value in study.best_params.items():
-            print(f"    {key}: {value}")
-        best_params = study.best_params
-        best_params['random_state'] = 42
-        best_params['n_jobs'] = -1
-        self.models['LightGBM'] = lgb.LGBMRegressor(**best_params)
-        print("\n--- LightGBM model in trainer has been updated with optimized hyperparameters. ---")
+        self.X_test_df = self.X_test.copy()
+
+        self.scaler_ar.fit(self.X_train[self.autoregressive_features])
+        self.scaler_env.fit(self.X_train[self.environmental_features])
+
+        def scale_and_combine(df):
+            df_ar_scaled = pd.DataFrame(
+                self.scaler_ar.transform(df[self.autoregressive_features]),
+                columns=self.autoregressive_features,
+                index=df.index,
+            )
+            df_env_scaled = pd.DataFrame(
+                self.scaler_env.transform(df[self.environmental_features]),
+                columns=self.environmental_features,
+                index=df.index,
+            )
+            return pd.concat([df_ar_scaled, df_env_scaled], axis=1)[self.features]
+
+        self.X_train_scaled = scale_and_combine(self.X_train)
+        self.X_train_part_scaled = scale_and_combine(self.X_train_part)
+        self.X_val_part_scaled = scale_and_combine(self.X_val_part)
+        self.X_test_scaled = scale_and_combine(self.X_test)
+        print("Data split and scaled in separate groups using StandardScaler.")
 
     def train(self):
-        """Trains all models defined in the constructor."""
+        """Trains all defined quantile models and captures training history."""
         print("--- Model Training Started ---")
         for name, model in self.models.items():
             print(f"  Training {name}...")
-            if "LightGBM" in name and 'n_estimators' not in model.get_params():
-                 model.fit(self.X_train_scaled, self.y_train, eval_set=[(self.X_test_scaled, self.y_test)], eval_metric='rmse', callbacks=[lgb.early_stopping(50, verbose=False)])
-            else:
-                model.fit(self.X_train_scaled, self.y_train)
-            self.trained_models[name] = model
+
+            model.fit(
+                self.X_train_part_scaled,
+                self.y_train_part,
+                eval_set=[(self.X_val_part_scaled, self.y_val_part)],
+                eval_metric="quantile",
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
+
+            self.training_histories[name] = model.evals_result_
+
+            best_iteration = model.best_iteration_ if model.best_iteration_ > 0 else 1
+            print(f"    Best iteration found: {best_iteration}")
+            final_model = lgb.LGBMRegressor(**model.get_params())
+            final_model.set_params(n_estimators=best_iteration)
+            final_model.fit(self.X_train_scaled, self.y_train)
+
+            self.trained_models[name] = final_model
         print("--- All models trained. ---")
 
     def evaluate(self):
-        """Evaluates all trained models and prints the results."""
-        results = pd.DataFrame(columns=['MAE', 'RMSE', 'R2'])
+        """
+        Evaluates models using appropriate metrics for quantile regression:
+        Pinball Loss, MAE, and RMSE.
+        """
+        from sklearn.metrics import mean_pinball_loss
+
+        results = pd.DataFrame(columns=["Pinball Loss", "MAE", "RMSE"])
+        y_test_original_scale = np.expm1(self.y_test)
+
         for name, model in self.trained_models.items():
-            preds = model.predict(self.X_test_scaled)
-            results.loc[name] = [
-                mean_absolute_error(self.y_test, preds),
-                np.sqrt(mean_squared_error(self.y_test, preds)),
-                r2_score(self.y_test, preds)
-            ]
-        print("\n--- Model Performance Metrics ---")
-        self.results = results.sort_values(by='RMSE')
+            if "50th" in name:
+                alpha = 0.50
+            elif "90th" in name:
+                alpha = 0.90
+            else:
+                alpha = 0.50
+
+            preds_log = model.predict(self.X_test_scaled)
+            preds_original_scale = np.expm1(preds_log)
+            preds_original_scale[preds_original_scale < 0] = 0
+
+            pinball = mean_pinball_loss(
+                y_test_original_scale, preds_original_scale, alpha=alpha
+            )
+            mae = mean_absolute_error(y_test_original_scale, preds_original_scale)
+            rmse = np.sqrt(
+                mean_squared_error(y_test_original_scale, preds_original_scale)
+            )
+
+            results.loc[name] = [pinball, mae, rmse]
+
+        print("\n--- Final Model Performance on Unseen Test Set (Original Scale) ---")
+        self.results = results.sort_values(by="Pinball Loss")
         print(self.results)
-        return self.results
 
-    def get_best_model(self):
-        """Identifies and returns the best performing model."""
-        best_model_name = self.results.index[0]
-        print(f"\nBest model identified: {best_model_name}")
-        return self.trained_models[best_model_name]
-
-    def save_artifacts(self, model, path='models'):
-        """Saves the best model and the scaler."""
+    def save_artifacts(self, path="models"):
+        """Saves all models and scalers."""
         os.makedirs(path, exist_ok=True)
-        joblib.dump(model, os.path.join(path, 'energy_forecasting_model.pkl'))
-        joblib.dump(self.scaler, os.path.join(path, 'feature_scaler.pkl'))
-        print(f"Model and scaler saved to '{path}' directory.")
+        for name, model in self.trained_models.items():
+            joblib.dump(model, os.path.join(path, f"model_{name}.pkl"))
+        joblib.dump(self.scaler_ar, os.path.join(path, "scaler_ar.pkl"))
+        joblib.dump(self.scaler_env, os.path.join(path, "scaler_env.pkl"))
+        print(f"All models and scalers saved to '{path}' directory.")
 
-    def generate_visualizations(self, model, model_name, path='report/figures'):
-        """Generates and saves all evaluation plots."""
-        os.makedirs(path, exist_ok=True)
+    def generate_visualizations(self, figures_path: str):
+        """Generates and saves all evaluation plots for each model."""
         print("\n--- Generating Visualizations ---")
-        
-        # Plot Predictions vs Actuals
-        preds = model.predict(self.X_test_scaled)
-        plt.figure(figsize=(15, 7))
-        plt.plot(self.y_test.index, self.y_test.values, label='Actuals', alpha=0.8)
-        plt.plot(self.y_test.index, preds, label='Predictions', linestyle='--', alpha=0.8)
-        plt.title(f'{model_name} - Predictions vs. Actuals')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(path, 'predictions_vs_actuals.png'))
-        plt.close()
-        print(f"  - Saved predictions_vs_actuals.png")
+        y_test_original = np.expm1(self.y_test)
 
-        # Plot Feature Importances
-        if hasattr(model, 'feature_importances_'):
-            importances = pd.DataFrame({
-                'feature': self.features,
-                'importance': model.feature_importances_
-            }).sort_values('importance', ascending=False).head(20)
-            
-            plt.figure(figsize=(10, 8))
-            sns.barplot(x='importance', y='feature', data=importances)
-            plt.title(f'Feature Importances ({model_name})')
+        for name, model in self.trained_models.items():
+            preds_log = model.predict(self.X_test_scaled)
+            preds_original = np.expm1(preds_log)
+            plt.figure(figsize=(15, 7))
+            plt.plot(self.y_test.index, y_test_original, label="Actuals", alpha=0.8)
+            plt.plot(
+                self.y_test.index,
+                preds_original,
+                label=f"Predictions ({name})",
+                linestyle="--",
+                alpha=0.8,
+            )
+            plt.title(f"{name} - Predictions vs. Actuals on Test Set")
+            plt.legend()
             plt.tight_layout()
-            plt.savefig(os.path.join(path, 'feature_importance.png'))
+            plt.savefig(os.path.join(figures_path, f"predictions_{name}.png"))
             plt.close()
-            print(f"  - Saved feature_importance.png")
+            print(f"  - Saved predictions_{name}.png")
 
-        # Plot Learning Curves
-        tscv = TimeSeriesSplit(n_splits=5)
-        sizes, train_scores, test_scores = learning_curve(model, self.X_train_scaled, self.y_train, cv=tscv, scoring='r2', n_jobs=-1)
-        plt.figure(figsize=(10, 6))
-        plt.plot(sizes, np.mean(train_scores, axis=1), 'o-', label='Training Score')
-        plt.plot(sizes, np.mean(test_scores, axis=1), 'o-', label='Cross-Validation Score')
-        plt.title(f'Learning Curves ({model_name})')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(path, 'learning_curves.png'))
-        plt.close()
-        print(f"  - Saved learning_curves.png")
-        
-        #SHAP ANALYSIS
-        if "LightGBM" in model_name or "Random Forest" in model_name:
-            print(f"--- Generating SHAP visualizations for {model_name} ---")
+            history = self.training_histories[name]
+            plt.figure(figsize=(10, 6))
+            plt.plot(history["valid_0"]["quantile"], label="Validation Score")
+            plt.title(f"Training Curve ({name})")
+            plt.xlabel("Boosting Round")
+            plt.ylabel("Quantile Loss")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(figures_path, f"training_curve_{name}.png"))
+            plt.close()
+            print(f"  - Saved training_curve_{name}.png")
+
+            print(f"--- Generating SHAP visualizations for {name} ---")
             explainer = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(self.X_test_scaled)
-            
-            # Use the unscaled X_test DataFrame for better plot interpretability
-            X_test_for_shap = self.X_test_df.copy()
-
-            # SHAP Summary Plot (like a better feature importance)
-            shap.summary_plot(shap_values, X_test_for_shap, plot_type="bar", show=False, max_display=20)
-            plt.title(f'SHAP Feature Importance ({model_name})')
+            plt.figure()
+            shap.summary_plot(
+                shap_values,
+                self.X_test_scaled,
+                plot_type="bar",
+                show=False,
+                max_display=20,
+            )
+            plt.title(f"SHAP Feature Importance ({name}) - Log Scale")
             plt.tight_layout()
-            plt.savefig(os.path.join(path, 'shap_summary_bar.png'))
+            plt.savefig(os.path.join(figures_path, f"shap_summary_{name}.png"))
             plt.close()
-            print(f"  - Saved shap_summary_bar.png")
-            
-            # SHAP Beeswarm Plot (shows feature value impact)
-            shap.summary_plot(shap_values, X_test_for_shap, show=False, max_display=20)
-            # Get the current figure and adjust layout
-            fig = plt.gcf()
-            fig.suptitle(f'SHAP Summary Plot ({model_name})', y=1.02)
-            plt.tight_layout()
-            plt.savefig(os.path.join(path, 'shap_summary_beeswarm.png'))
-            plt.close()
-            print(f"  - Saved shap_summary_beeswarm.png")
+            print(f"  - Saved shap_summary_{name}.png")
