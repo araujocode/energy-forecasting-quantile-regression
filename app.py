@@ -48,53 +48,47 @@ def load_artifacts():
 
     return model_median, model_peak, scaler_ar, scaler_env, full_data, features
 
-
-# vvvvvvvvvvvvvvvv THIS IS THE FIX vvvvvvvvvvvvvvvv
-# REMOVED the @st.cache_resource decorator from this function to prevent incorrect caching.
 def get_shap_explainer(_model):
     """Creates the SHAP explainer for a given model."""
     return shap.TreeExplainer(_model)
-
-
-# ^^^^^^^^^^^^^^^^ END OF FIX ^^^^^^^^^^^^^^^
 
 model_median, model_peak, scaler_ar, scaler_env, full_data, EXPECTED_COLUMNS = (
     load_artifacts()
 )
 
 # --- App Layout ---
-st.title("💡 Energy Consumption Forecaster")
+st.title("💡 Previsor de Consumo de Energia")
 
 if model_median is None:
     st.stop()
 
 st.markdown(
     """
-Welcome to the interactive energy forecasting tool. This application uses a sophisticated machine learning pipeline to predict appliance energy usage. Instead of a single, often inaccurate prediction, we use a **Quantile Regression** strategy to provide two distinct forecasts:
+Bem-vindo à ferramenta interativa de previsão de consumo de energia. Este aplicativo utiliza um sofisticado pipeline de aprendizado de máquina para prever o uso de energia de eletrodomésticos. Em vez de uma única previsão, muitas vezes imprecisa, usamos uma estratégia de **Regressão Quantílica** para fornecer duas previsões distintas:
 
-- **Median Forecast (50th Percentile):** A reliable estimate of the *typical*, baseline energy usage.
-- **Peak Forecast (90th Percentile):** A crucial "warning" forecast that predicts high-end usage, helping to anticipate costly energy spikes.
+- **Previsão Mediana (50º Percentil):** Uma estimativa confiável do consumo *típico* de energia.
+- **Previsão de Pico (90º Percentil):** Uma previsão importante que indica possíveis picos de consumo, ajudando a antecipar gastos elevados.
 
-Use the sidebar to select a time from the test period and see how the models perform against real data.
+Use a barra lateral para selecionar um horário do período de teste e veja como os modelos se comportam em relação aos dados reais.
 """
 )
 
 # --- Sidebar for User Inputs ---
 with st.sidebar:
-    st.header("Forecasting Options")
+    st.header("Opções de Previsão")
 
     test_period_start_index = int(len(full_data) * 0.85)
     test_period_start = full_data["date"].iloc[test_period_start_index]
     test_period_end = full_data["date"].iloc[-1]
 
     selected_date = st.slider(
-        "Select a Date and Time",
+        "Selecione uma Data e Hora",
         min_value=test_period_start.to_pydatetime(),
         max_value=test_period_end.to_pydatetime(),
         value=test_period_start.to_pydatetime(),
         step=pd.Timedelta(minutes=10),
         format="YYYY-MM-DD HH:mm",
-        help="Choose a point in time to generate a forecast for. The app will use the 24 hours of data prior to this time to make its prediction.",
+        help="Escolha um momento para gerar a previsão. O app usará as 24 horas anteriores para fazer a previsão.",
     )
 
 # --- Prediction Logic ---
@@ -154,46 +148,46 @@ pred_final_peak = max(0, np.expm1(pred_log_peak))
 actual_value = history_df.iloc[-1]["Appliances"]
 
 # --- Display Results ---
-st.header(f"Forecast for: {selected_date.strftime('%Y-%m-%d %H:%M')}")
+st.header(f"Previsão para: {selected_date.strftime('%Y-%m-%d %H:%M')}")
 col1, col2, col3 = st.columns(3)
-col1.metric("Actual Value (Wh)", f"{actual_value:.2f}")
+col1.metric("Valor Real (Wh)", f"{actual_value:.2f}")
 col2.metric(
-    "Median Forecast (50th %)",
+    "Previsão Mediana (50º %)",
     f"{pred_final_median:.2f}",
     delta=f"{(pred_final_median - actual_value):.2f}",
 )
 col3.metric(
-    "Peak Forecast (90th %)",
+    "Previsão de Pico (90º %)",
     f"{pred_final_peak:.2f}",
     delta=f"{(pred_final_peak - actual_value):.2f}",
 )
 
-with st.expander("What do these forecasts mean?"):
+with st.expander("O que significam essas previsões?"):
     st.markdown(
         """
-    - The **Median Forecast** is the model's best guess for the *most likely* energy usage. You can see it tracks the baseline consumption well.
-    - The **Peak Forecast** is a high-end estimate. It is designed to be sensitive to conditions that lead to energy spikes. A high value here acts as an important warning signal.
+    - A **Previsão Mediana** é a melhor estimativa do modelo para o consumo *mais provável* de energia. Você pode ver que ela acompanha bem o consumo base.
+    - A **Previsão de Pico** é uma estimativa para valores altos. Ela é sensível a condições que levam a picos de consumo. Um valor alto aqui serve como um importante sinal de alerta.
     """
     )
 
-st.subheader("Prediction in Context")
+st.subheader("Previsão em Contexto")
 history_to_plot = history_df.set_index("date").iloc[-144:]
 fig, ax = plt.subplots(figsize=(12, 5))
 ax.plot(
     history_to_plot.index,
     history_to_plot["Appliances"],
-    label="Historical Actuals",
+    label="Histórico Real",
     color="black",
     alpha=0.7,
 )
-ax.axvline(selected_date, color="gray", linestyle="--", label="Forecast Time")
+ax.axvline(selected_date, color="gray", linestyle="--", label="Hora da Previsão")
 ax.plot(
     selected_date,
     pred_final_median,
     "o",
     color="dodgerblue",
     markersize=8,
-    label="Median Forecast",
+    label="Previsão Mediana",
 )
 ax.plot(
     selected_date,
@@ -201,7 +195,7 @@ ax.plot(
     "o",
     color="orangered",
     markersize=8,
-    label="Peak Forecast",
+    label="Previsão de Pico",
 )
 ax.plot(
     selected_date,
@@ -209,10 +203,10 @@ ax.plot(
     "o",
     color="limegreen",
     markersize=8,
-    label="Actual Value",
+    label="Valor Real",
 )
-ax.set_title("Energy Consumption Forecasts vs. Actuals")
-ax.set_ylabel("Appliance Energy (Wh)")
+ax.set_title("Previsões de Consumo de Energia vs. Valores Reais")
+ax.set_ylabel("Energia dos Eletrodomésticos (Wh)")
 ax.legend()
 plt.tight_layout()
 st.pyplot(fig)
@@ -232,20 +226,20 @@ def shap_plot(explainer, shap_values, features):
     st.pyplot(p, bbox_inches="tight", clear_figure=True)
 
 
-st.subheader("Why did the models make these predictions?")
+st.subheader("Por que os modelos fizeram essas previsões?")
 st.markdown(
-    "These **SHAP plots** show the impact of each feature on the final prediction. Features in **red** pushed the prediction higher, while features in **blue** pushed it lower. This shows how the model 'thinks'."
+    "Estes **gráficos SHAP** mostram o impacto de cada variável na previsão final. Variáveis em **vermelho** aumentaram a previsão, enquanto variáveis em **azul** diminuíram. Isso mostra como o modelo 'pensa'."
 )
 col_shap1, col_shap2 = st.columns(2)
 
 with col_shap1:
-    st.markdown("##### Median Forecast Explanation")
+    st.markdown("##### Explicação da Previsão Mediana")
     explainer_median = get_shap_explainer(model_median)
     shap_values_median = explainer_median.shap_values(X_pred_scaled)
     shap_plot(explainer_median, shap_values_median[0, :], X_pred)
 
 with col_shap2:
-    st.markdown("##### Peak Forecast Explanation")
+    st.markdown("##### Explicação da Previsão de Pico")
     explainer_peak = get_shap_explainer(model_peak)
     shap_values_peak = explainer_peak.shap_values(X_pred_scaled)
     shap_plot(explainer_peak, shap_values_peak[0, :], X_pred)
