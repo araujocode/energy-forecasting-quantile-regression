@@ -195,7 +195,10 @@ class ModelTrainer:
             model.fit(
                 X_train_part_scaled,
                 y_train_part,
-                eval_set=[(X_val_part_scaled, y_val_part)],
+                eval_set=[
+                    (X_train_part_scaled, y_train_part),
+                    (X_val_part_scaled, y_val_part),
+                ],
                 eval_metric="quantile",
                 callbacks=[lgb.early_stopping(50, verbose=False)],
             )
@@ -311,7 +314,8 @@ class ModelTrainer:
 
             history = self.training_histories[name]
             plt.figure(figsize=(10, 6))
-            plt.plot(history["valid_0"]["quantile"], label="Validation Score")
+            plt.plot(history["training"]["quantile"], label="Training Score")
+            plt.plot(history["valid_1"]["quantile"], label="Validation Score")
             plt.title(f"Training Curve ({name})")
             plt.xlabel("Boosting Round")
             plt.ylabel("Quantile Loss")
