@@ -5,6 +5,9 @@ import os
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_pinball_loss
+from sklearn.model_selection import (
+    TimeSeriesSplit,
+)  # <-- Re-introducing TimeSeriesSplit
 import lightgbm as lgb
 import shap
 import optuna
@@ -12,8 +15,8 @@ import optuna
 
 class ModelTrainer:
     """
-    Implements and tunes Quantile Regression models using Optuna,
-    generates correct training curves, and evaluates using Pinball Loss.
+    Final version: Implements and tunes Quantile Regression models using Optuna
+    with a robust TimeSeries Cross-Validation strategy.
     """
 
     def __init__(self, df: pd.DataFrame, features: list, target: str):
@@ -21,7 +24,6 @@ class ModelTrainer:
         self.features = features
         self.target = target
 
-        # We start with placeholder models, as they will be updated by Optuna
         self.models = {
             "Median_Forecast (50th)": lgb.LGBMRegressor(
                 objective="quantile", alpha=0.5, random_state=42, verbose=-1
@@ -37,7 +39,7 @@ class ModelTrainer:
         self.scaler_env = StandardScaler()
 
     def prepare_data(self):
-        """Splits data and scales feature groups separately."""
+        """Prepares data for cross-validation and final testing."""
         if "lights" in self.features:
             self.features.remove("lights")
             print("Removed 'lights' feature.")
@@ -48,6 +50,7 @@ class ModelTrainer:
         self.environmental_features = [
             col for col in self.features if col not in self.autoregressive_features
         ]
+
         X = self.df[self.features]
         y = self.df[self.target]
 
@@ -55,17 +58,122 @@ class ModelTrainer:
         self.X_train, self.X_test = X.iloc[:train_end_idx], X.iloc[train_end_idx:]
         self.y_train, self.y_test = y.iloc[:train_end_idx], y.iloc[train_end_idx:]
 
-        train_val_split_idx = int(len(self.X_train) * 0.8)
-        self.X_train_part = self.X_train.iloc[:train_val_split_idx]
-        self.y_train_part = self.y_train.iloc[:train_val_split_idx]
-        self.X_val_part = self.X_train.iloc[train_val_split_idx:]
-        self.y_val_part = self.y_train.iloc[train_val_split_idx:]
-
-        self.X_test_df = self.X_test.copy()
-
+        # Fit scalers on the entire training set. They will be applied within each CV fold.
         self.scaler_ar.fit(self.X_train[self.autoregressive_features])
         self.scaler_env.fit(self.X_train[self.environmental_features])
 
+        print("Data prepared. Scalers fitted on the full training set.")
+
+    def optimize_hyperparameters(self, n_trials=50):
+        """Uses Optuna with TimeSeries Cross-Validation for robust tuning."""
+        print(
+            f"--- Starting Cross-Validated Hyperparameter Optimization ({n_trials} trials) ---"
+        )
+
+        def objective(trial):
+            params = {
+                "objective": "quantile",
+                "alpha": 0.5,
+                "metric": "quantile",
+                "n_estimators": trial.suggest_int("n_estimators", 500, 2000),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1),
+                "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+                "max_depth": trial.suggest_int("max_depth", 5, 15),
+                "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
+                "random_state": 42,
+                "n_jobs": -1,
+                "verbose": -1,
+            }
+
+            tscv = TimeSeriesSplit(n_splits=10)
+            scores = []
+
+            def scale_and_combine(df, features, ar_features, env_features):
+                df_ar_s = pd.DataFrame(
+                    self.scaler_ar.transform(df[ar_features]),
+                    columns=ar_features,
+                    index=df.index,
+                )
+                df_env_s = pd.DataFrame(
+                    self.scaler_env.transform(df[env_features]),
+                    columns=env_features,
+                    index=df.index,
+                )
+                # Return a DataFrame with the correct feature order
+                return pd.concat([df_ar_s, df_env_s], axis=1)[features]
+
+            for train_idx, val_idx in tscv.split(self.X_train):
+                X_train_fold, X_val_fold = (
+                    self.X_train.iloc[train_idx],
+                    self.X_train.iloc[val_idx],
+                )
+                y_train_fold, y_val_fold = (
+                    self.y_train.iloc[train_idx],
+                    self.y_train.iloc[val_idx],
+                )
+
+                X_train_fold_scaled = scale_and_combine(
+                    X_train_fold,
+                    self.features,
+                    self.autoregressive_features,
+                    self.environmental_features,
+                )
+                X_val_fold_scaled = scale_and_combine(
+                    X_val_fold,
+                    self.features,
+                    self.autoregressive_features,
+                    self.environmental_features,
+                )
+
+                model = lgb.LGBMRegressor(**params)
+                model.fit(
+                    X_train_fold_scaled,
+                    y_train_fold,
+                    eval_set=[(X_val_fold_scaled, y_val_fold)],
+                    callbacks=[lgb.early_stopping(50, verbose=False)],
+                )
+
+                preds_log = model.predict(X_val_fold_scaled)
+                loss = mean_pinball_loss(y_val_fold, preds_log, alpha=0.5)
+                scores.append(loss)
+
+            return np.mean(scores)  # Return the average score across all folds
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=n_trials)
+
+        print("\nBest trial found by Optuna (Cross-Validated):")
+        print(f"  Value (Average Pinball Loss): {study.best_value:.4f}")
+        self.best_params = study.best_params
+        for key, value in self.best_params.items():
+            print(f"    {key}: {value}")
+
+        base_params = self.best_params
+        base_params["random_state"] = 42
+        base_params["n_jobs"] = -1
+        base_params["verbose"] = -1
+
+        self.models["Median_Forecast (50th)"] = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.5, **base_params
+        )
+        self.models["Peak_Forecast (90th)"] = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.9, **base_params
+        )
+        print("\n--- Quantile models updated with robustly tuned hyperparameters. ---")
+
+    def train(self):
+        """Trains the final models and captures training history."""
+        print("--- Model Training Started ---")
+
+        # We need a validation set for early stopping to find the best n_estimators
+        train_val_split_idx = int(len(self.X_train) * 0.8)
+        X_train_part = self.X_train.iloc[:train_val_split_idx]
+        y_train_part = self.y_train.iloc[:train_val_split_idx]
+        X_val_part = self.X_train.iloc[train_val_split_idx:]
+        y_val_part = self.y_train.iloc[train_val_split_idx:]
+
+        # Helper to scale data for this stage
         def scale_and_combine(df):
             df_ar_scaled = pd.DataFrame(
                 self.scaler_ar.transform(df[self.autoregressive_features]),
@@ -79,88 +187,20 @@ class ModelTrainer:
             )
             return pd.concat([df_ar_scaled, df_env_scaled], axis=1)[self.features]
 
-        self.X_train_scaled = scale_and_combine(self.X_train)
-        self.X_train_part_scaled = scale_and_combine(self.X_train_part)
-        self.X_val_part_scaled = scale_and_combine(self.X_val_part)
-        self.X_test_scaled = scale_and_combine(self.X_test)
-        print("Data split and scaled in separate groups using StandardScaler.")
+        X_train_part_scaled = scale_and_combine(X_train_part)
+        X_val_part_scaled = scale_and_combine(X_val_part)
 
-    def optimize_hyperparameters(self, n_trials=50):
-        """Uses Optuna to find the best hyperparameters for the quantile models."""
-        print(
-            f"--- Starting Hyperparameter Optimization with Optuna ({n_trials} trials) ---"
-        )
-
-        def objective(trial):
-            # We tune on the median model, as its parameters are generally robust
-            alpha = 0.5
-            params = {
-                "objective": "quantile",
-                "alpha": alpha,
-                "metric": "quantile",
-                "n_estimators": trial.suggest_int("n_estimators", 500, 2000),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1),
-                "num_leaves": trial.suggest_int("num_leaves", 20, 150),
-                "max_depth": trial.suggest_int("max_depth", 5, 15),
-                "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
-                "random_state": 42,
-                "n_jobs": -1,
-                "verbose": -1,
-            }
-            model = lgb.LGBMRegressor(**params)
-
-            model.fit(
-                self.X_train_part_scaled,
-                self.y_train_part,
-                eval_set=[(self.X_val_part_scaled, self.y_val_part)],
-                callbacks=[lgb.early_stopping(50, verbose=False)],
-            )
-
-            preds_log = model.predict(self.X_val_part_scaled)
-            loss = mean_pinball_loss(self.y_val_part, preds_log, alpha=alpha)
-            return loss
-
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=n_trials)
-
-        print("\nBest trial found by Optuna:")
-        print(f"  Value (Validation Pinball Loss): {study.best_value:.4f}")
-        print("  Best Params: ")
-        best_params = study.best_params
-        for key, value in best_params.items():
-            print(f"    {key}: {value}")
-
-        # Update both models with the best structural parameters found
-        base_params = best_params
-        base_params["random_state"] = 42
-        base_params["n_jobs"] = -1
-        base_params["verbose"] = -1
-
-        self.models["Median_Forecast (50th)"] = lgb.LGBMRegressor(
-            objective="quantile", alpha=0.5, **base_params
-        )
-        self.models["Peak_Forecast (90th)"] = lgb.LGBMRegressor(
-            objective="quantile", alpha=0.9, **base_params
-        )
-        print("\n--- Quantile models updated with optimized hyperparameters. ---")
-
-    def train(self):
-        """Trains all defined quantile models and captures training history."""
-        print("--- Model Training Started ---")
         for name, model in self.models.items():
             print(f"  Training {name}...")
-
             model.fit(
-                self.X_train_part_scaled,
-                self.y_train_part,
-                eval_set=[(self.X_val_part_scaled, self.y_val_part)],
+                X_train_part_scaled,
+                y_train_part,
+                eval_set=[(X_val_part_scaled, y_val_part)],
                 eval_metric="quantile",
                 callbacks=[lgb.early_stopping(50, verbose=False)],
             )
 
             self.training_histories[name] = model.evals_result_
-
             best_iteration = (
                 model.best_iteration_
                 if model.best_iteration_ is not None and model.best_iteration_ > 0
@@ -170,7 +210,9 @@ class ModelTrainer:
 
             final_model = lgb.LGBMRegressor(**model.get_params())
             final_model.set_params(n_estimators=best_iteration)
-            final_model.fit(self.X_train_scaled, self.y_train)
+
+            X_train_scaled = scale_and_combine(self.X_train)
+            final_model.fit(X_train_scaled, self.y_train)
 
             self.trained_models[name] = final_model
         print("--- All models trained. ---")
@@ -180,6 +222,22 @@ class ModelTrainer:
         results = pd.DataFrame(columns=["Pinball Loss", "MAE", "RMSE"])
         y_test_original_scale = np.expm1(self.y_test)
 
+        X_test_scaled = pd.concat(
+            [
+                pd.DataFrame(
+                    self.scaler_ar.transform(self.X_test[self.autoregressive_features]),
+                    columns=self.autoregressive_features,
+                    index=self.X_test.index,
+                ),
+                pd.DataFrame(
+                    self.scaler_env.transform(self.X_test[self.environmental_features]),
+                    columns=self.environmental_features,
+                    index=self.X_test.index,
+                ),
+            ],
+            axis=1,
+        )[self.features]
+
         for name, model in self.trained_models.items():
             if "50th" in name:
                 alpha = 0.50
@@ -188,7 +246,7 @@ class ModelTrainer:
             else:
                 alpha = 0.50
 
-            preds_log = model.predict(self.X_test_scaled)
+            preds_log = model.predict(X_test_scaled)
             preds_original_scale = np.expm1(preds_log)
             preds_original_scale[preds_original_scale < 0] = 0
 
@@ -199,7 +257,6 @@ class ModelTrainer:
             rmse = np.sqrt(
                 mean_squared_error(y_test_original_scale, preds_original_scale)
             )
-
             results.loc[name] = [pinball, mae, rmse]
 
         print("\n--- Final Model Performance on Unseen Test Set (Original Scale) ---")
@@ -217,9 +274,24 @@ class ModelTrainer:
     def generate_visualizations(self, figures_path: str):
         print("\n--- Generating Visualizations ---")
         y_test_original = np.expm1(self.y_test)
+        X_test_scaled = pd.concat(
+            [
+                pd.DataFrame(
+                    self.scaler_ar.transform(self.X_test[self.autoregressive_features]),
+                    columns=self.autoregressive_features,
+                    index=self.X_test.index,
+                ),
+                pd.DataFrame(
+                    self.scaler_env.transform(self.X_test[self.environmental_features]),
+                    columns=self.environmental_features,
+                    index=self.X_test.index,
+                ),
+            ],
+            axis=1,
+        )[self.features]
 
         for name, model in self.trained_models.items():
-            preds_log = model.predict(self.X_test_scaled)
+            preds_log = model.predict(X_test_scaled)
             preds_original = np.expm1(preds_log)
             plt.figure(figsize=(15, 7))
             plt.plot(self.y_test.index, y_test_original, label="Actuals", alpha=0.8)
@@ -252,14 +324,10 @@ class ModelTrainer:
 
             print(f"--- Generating SHAP visualizations for {name} ---")
             explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(self.X_test_scaled)
+            shap_values = explainer.shap_values(X_test_scaled)
             plt.figure()
             shap.summary_plot(
-                shap_values,
-                self.X_test_scaled,
-                plot_type="bar",
-                show=False,
-                max_display=20,
+                shap_values, X_test_scaled, plot_type="bar", show=False, max_display=20
             )
             plt.title(f"SHAP Feature Importance ({name}) - Log Scale")
             plt.tight_layout()

@@ -214,7 +214,6 @@ st.pyplot(fig)
 
 
 # --- SHAP Plot Display ---
-# vvvvvvvvvvvvvvvv THIS IS THE FIX vvvvvvvvvvvvvvvv
 def shap_plot(explainer, shap_values, features):
     """Helper function to create and robustly display a SHAP force plot."""
     # Let shap create the plot on the global figure context
@@ -228,9 +227,6 @@ def shap_plot(explainer, shap_values, features):
     )
     # Grab the current figure that SHAP just created and pass it to Streamlit
     st.pyplot(plt.gcf(), bbox_inches="tight", clear_figure=True)
-
-
-# ^^^^^^^^^^^^^^^^ END OF FIX ^^^^^^^^^^^^^^^
 
 st.subheader("Por que os modelos fizeram essas previsões?")
 st.markdown(
