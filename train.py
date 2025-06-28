@@ -43,7 +43,7 @@ def main():
     # Save the final models and scalers
     trainer.save_artifacts()
 
-    # Generate all visualizations for the report
+    # Generate all visualizations
     trainer.generate_visualizations(figures_path=run_dir)
 
     print(f"\n--- Pipeline Finished Successfully. All figures saved in {run_dir} ---")

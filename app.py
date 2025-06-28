@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,7 +15,7 @@ st.set_page_config(
 
 
 # --- Load Artifacts ---
-# Use @st.cache_resource to load these heavy objects only once.
+# Using @st.cache_resource to load these heavy objects only once.
 @st.cache_resource
 def load_artifacts():
     """Loads all necessary models, scalers, data, and feature lists."""
@@ -227,6 +226,7 @@ def shap_plot(explainer, shap_values, features):
     )
     # Grab the current figure that SHAP just created and pass it to Streamlit
     st.pyplot(plt.gcf(), bbox_inches="tight", clear_figure=True)
+
 
 st.subheader("Por que os modelos fizeram essas previsões?")
 st.markdown(
