@@ -83,7 +83,9 @@ This project's core complexity lies in its advanced modeling and evaluation stra
 3. **Quantile Regression:** Instead of standard regression, this pipeline uses **Quantile Regression** with a LightGBM model. This state-of-the-art technique allows us to train specialized models:
     * **Median Forecast (`alpha=0.5`):** Predicts the 50th percentile, representing the most likely, typical energy usage.
     * **Peak Forecast (`alpha=0.9`):** Predicts the 90th percentile, specifically trained to identify conditions that lead to high-energy spikes.
-4. **Training & Evaluation:**
+4. **Hyperparameter Optimization with Cross-Validation:**
+    * Hyperparameters for the quantile models are tuned using **Optuna** with a robust **10-fold time series cross-validation** strategy. This ensures that the selected parameters generalize well to unseen data and respects the temporal structure of the dataset.
+5. **Training & Evaluation:**
     * **Early Stopping:** Models are trained with early stopping using the validation set to find the optimal number of boosting rounds and prevent overfitting.
     * **Appropriate Metrics:** The models are evaluated on the unseen test set using metrics suitable for this problem. The misleading R² score is discarded in favor of:
         * **Pinball Loss:** The industry-standard metric for evaluating quantile regression models.
@@ -135,5 +137,3 @@ streamlit run app.py
 ```
 
 Your default web browser will open with the interactive forecasting tool.
-
------
