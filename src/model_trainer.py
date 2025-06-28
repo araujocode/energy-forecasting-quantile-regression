@@ -3,23 +3,17 @@ import numpy as np
 import joblib
 import os
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-    mean_pinball_loss,
-)
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_pinball_loss
 import lightgbm as lgb
 import shap
+import optuna
 
 
 class ModelTrainer:
     """
-    Final version: Implements Quantile Regression, generates correct training
-    curves, and evaluates using the correct metric (Pinball Loss).
+    Implements and tunes Quantile Regression models using Optuna,
+    generates correct training curves, and evaluates using Pinball Loss.
     """
 
     def __init__(self, df: pd.DataFrame, features: list, target: str):
@@ -27,25 +21,13 @@ class ModelTrainer:
         self.features = features
         self.target = target
 
-        # Using pre-determined robust hyperparameters for quantile regression
+        # We start with placeholder models, as they will be updated by Optuna
         self.models = {
             "Median_Forecast (50th)": lgb.LGBMRegressor(
-                objective="quantile",
-                alpha=0.5,
-                n_estimators=1000,
-                learning_rate=0.05,
-                num_leaves=31,
-                random_state=42,
-                verbose=-1,
+                objective="quantile", alpha=0.5, random_state=42, verbose=-1
             ),
             "Peak_Forecast (90th)": lgb.LGBMRegressor(
-                objective="quantile",
-                alpha=0.9,
-                n_estimators=1000,
-                learning_rate=0.05,
-                num_leaves=31,
-                random_state=42,
-                verbose=-1,
+                objective="quantile", alpha=0.9, random_state=42, verbose=-1
             ),
         }
 
@@ -73,7 +55,6 @@ class ModelTrainer:
         self.X_train, self.X_test = X.iloc[:train_end_idx], X.iloc[train_end_idx:]
         self.y_train, self.y_test = y.iloc[:train_end_idx], y.iloc[train_end_idx:]
 
-        # Create a validation set from the end of the training set
         train_val_split_idx = int(len(self.X_train) * 0.8)
         self.X_train_part = self.X_train.iloc[:train_val_split_idx]
         self.y_train_part = self.y_train.iloc[:train_val_split_idx]
@@ -104,6 +85,66 @@ class ModelTrainer:
         self.X_test_scaled = scale_and_combine(self.X_test)
         print("Data split and scaled in separate groups using StandardScaler.")
 
+    def optimize_hyperparameters(self, n_trials=50):
+        """Uses Optuna to find the best hyperparameters for the quantile models."""
+        print(
+            f"--- Starting Hyperparameter Optimization with Optuna ({n_trials} trials) ---"
+        )
+
+        def objective(trial):
+            # We tune on the median model, as its parameters are generally robust
+            alpha = 0.5
+            params = {
+                "objective": "quantile",
+                "alpha": alpha,
+                "metric": "quantile",
+                "n_estimators": trial.suggest_int("n_estimators", 500, 2000),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1),
+                "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+                "max_depth": trial.suggest_int("max_depth", 5, 15),
+                "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
+                "random_state": 42,
+                "n_jobs": -1,
+                "verbose": -1,
+            }
+            model = lgb.LGBMRegressor(**params)
+
+            model.fit(
+                self.X_train_part_scaled,
+                self.y_train_part,
+                eval_set=[(self.X_val_part_scaled, self.y_val_part)],
+                callbacks=[lgb.early_stopping(50, verbose=False)],
+            )
+
+            preds_log = model.predict(self.X_val_part_scaled)
+            loss = mean_pinball_loss(self.y_val_part, preds_log, alpha=alpha)
+            return loss
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=n_trials)
+
+        print("\nBest trial found by Optuna:")
+        print(f"  Value (Validation Pinball Loss): {study.best_value:.4f}")
+        print("  Best Params: ")
+        best_params = study.best_params
+        for key, value in best_params.items():
+            print(f"    {key}: {value}")
+
+        # Update both models with the best structural parameters found
+        base_params = best_params
+        base_params["random_state"] = 42
+        base_params["n_jobs"] = -1
+        base_params["verbose"] = -1
+
+        self.models["Median_Forecast (50th)"] = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.5, **base_params
+        )
+        self.models["Peak_Forecast (90th)"] = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.9, **base_params
+        )
+        print("\n--- Quantile models updated with optimized hyperparameters. ---")
+
     def train(self):
         """Trains all defined quantile models and captures training history."""
         print("--- Model Training Started ---")
@@ -120,8 +161,13 @@ class ModelTrainer:
 
             self.training_histories[name] = model.evals_result_
 
-            best_iteration = model.best_iteration_ if model.best_iteration_ > 0 else 1
+            best_iteration = (
+                model.best_iteration_
+                if model.best_iteration_ is not None and model.best_iteration_ > 0
+                else model.get_params()["n_estimators"]
+            )
             print(f"    Best iteration found: {best_iteration}")
+
             final_model = lgb.LGBMRegressor(**model.get_params())
             final_model.set_params(n_estimators=best_iteration)
             final_model.fit(self.X_train_scaled, self.y_train)
@@ -130,12 +176,7 @@ class ModelTrainer:
         print("--- All models trained. ---")
 
     def evaluate(self):
-        """
-        Evaluates models using appropriate metrics for quantile regression:
-        Pinball Loss, MAE, and RMSE.
-        """
-        from sklearn.metrics import mean_pinball_loss
-
+        """Evaluates models using Pinball Loss, MAE, and RMSE."""
         results = pd.DataFrame(columns=["Pinball Loss", "MAE", "RMSE"])
         y_test_original_scale = np.expm1(self.y_test)
 
@@ -166,7 +207,6 @@ class ModelTrainer:
         print(self.results)
 
     def save_artifacts(self, path="models"):
-        """Saves all models and scalers."""
         os.makedirs(path, exist_ok=True)
         for name, model in self.trained_models.items():
             joblib.dump(model, os.path.join(path, f"model_{name}.pkl"))
@@ -175,7 +215,6 @@ class ModelTrainer:
         print(f"All models and scalers saved to '{path}' directory.")
 
     def generate_visualizations(self, figures_path: str):
-        """Generates and saves all evaluation plots for each model."""
         print("\n--- Generating Visualizations ---")
         y_test_original = np.expm1(self.y_test)
 
